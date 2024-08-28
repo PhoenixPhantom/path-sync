@@ -1,0 +1,5 @@
+#!/bin/bash
+
+mount ~/mtp
+path-sync -sync:tablet
+umount ~/mtp
