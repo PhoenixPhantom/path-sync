@@ -8,7 +8,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-PATH_SYNC_VERSION :: "0.2.3"
+PATH_SYNC_VERSION :: "0.3.1"
 
 OptionsSet :: distinct bit_set[OptionFlags]
 OptionFlags :: enum {
@@ -565,7 +565,7 @@ expand_folder :: proc(folder: ^FSObject, path: string) -> bool {
 		assert(sep_char_index >= 0, "The path must be a valid path")
 		pre_sep_path_rune_len := strings.rune_count(file.fullpath[:sep_char_index + 1])
 		name := strings.cut(file.fullpath, pre_sep_path_rune_len)
-		if name == TREECACHE_FILE {
+		if name[0] == '.' && strings.contains(name, TREECACHE_NAME) {
 			children2 := make([]FSObject, len(children) - 1)
 			copy(children2[:i], children[:i]) //slice ranges [x:y] <==> all i in x..<y
 			shorting += 1
@@ -605,7 +605,8 @@ free_diff :: proc(diff: ^DiffObject) {
 	delete(diff.children)
 }
 
-TREECACHE_FILE :: ".tree_cache.json"
+LEGACY_TREECACHE_FILE :: ".tree_cache.json"
+TREECACHE_NAME :: "tree_cache.json"
 
 FSObject_from_json :: proc(object: json.Object) -> (fs: FSObject, ok: bool) {
 	last_changed_ns := object["last_changed"].(json.Integer) or_return
@@ -656,11 +657,26 @@ is_empty_tree_cache :: proc(ft: Filetree) -> bool {
 
 DEFAULT_FILETREE :: Filetree{os.INVALID_HANDLE, {}, 0}
 
-open_tree_cache :: proc(path: string) -> (filetree := DEFAULT_FILETREE, ok: bool) {
-	filetree_path, alloc_error := strings.join({path, TREECACHE_FILE}, SEPARATOR)
+open_tree_cache :: proc(
+	path: string,
+	file_name: string,
+) -> (
+	filetree := DEFAULT_FILETREE,
+	ok: bool,
+) {
+	filetree_path, alloc_error := strings.join({path, file_name}, SEPARATOR)
 	if alloc_error != .None do return
+	defer delete(filetree_path)
 
-	if !os.exists(filetree_path) do return DEFAULT_FILETREE, true
+	if !os.exists(filetree_path) {
+		log.infof("Cannot find filetree: %s", file_name)
+		if file_name == LEGACY_TREECACHE_FILE {
+			return DEFAULT_FILETREE, false
+		} else {
+			log.infof("Searching for legacy filetree")
+			return open_tree_cache(path, LEGACY_TREECACHE_FILE)
+		}
+	}
 	open_err: os.Errno
 	filetree.file_handle, open_err = os.open(filetree_path, os.O_RDWR | os.O_CREATE)
 	if open_err != nil do return
@@ -683,8 +699,8 @@ open_tree_cache :: proc(path: string) -> (filetree := DEFAULT_FILETREE, ok: bool
 	return filetree, ok
 }
 
-write_tree_cache :: proc(path: string, filetree: Filetree) -> bool {
-	filetree_path, alloc_error := strings.join({path, TREECACHE_FILE}, SEPARATOR)
+write_tree_cache :: proc(path: string, filetree: Filetree, file_name: string) -> bool {
+	filetree_path, alloc_error := strings.join({path, file_name}, SEPARATOR)
 	if alloc_error != .None do return false
 
 	json_filetree := FSObject_to_json(filetree.tree) or_return
@@ -769,7 +785,7 @@ create_diff_tree :: proc(last_saved, current: FSObject) -> (diff: []DiffObject) 
 }
 
 
-sync :: proc(config_handle: os.Handle) -> bool {
+sync :: proc(config_handle: os.Handle, tree_cache_file: string) -> bool {
 	file := os.read_entire_file_from_handle(config_handle) or_return
 	it := string(file)
 
@@ -821,7 +837,7 @@ sync :: proc(config_handle: os.Handle) -> bool {
 			continue
 		}
 		ok: bool
-		tree_caches[i], ok = open_tree_cache(paths[i])
+		tree_caches[i], ok = open_tree_cache(paths[i], tree_cache_file)
 		if !ok {
 			log.fatalf("Cannot interpret tree cache in %s.", paths[i])
 			continue
@@ -842,7 +858,13 @@ sync :: proc(config_handle: os.Handle) -> bool {
 			if is_empty_tree_cache(tree_cache) do continue
 			if id < 0 {
 				id = tree_cache.id
-			} else if id != tree_cache.id do panic("Cannot sync: The different sync targets are not part of the same subtree. (Id missmatch)")
+			} else if id != tree_cache.id {
+				log.panicf(
+					"Cannot sync: The different sync targets are not part of the same subtree. (Id missmatch (%v vs %v))",
+					id,
+					tree_cache.id,
+				)
+			}
 		}
 	}
 
@@ -864,7 +886,7 @@ sync :: proc(config_handle: os.Handle) -> bool {
 			new_tree_cache_id,
 		}
 		expand_folder(&filetree.tree, paths[i]) or_return
-		write_tree_cache(paths[i], filetree) or_return
+		write_tree_cache(paths[i], filetree, tree_cache_file) or_return
 		free_folder(&filetree.tree)
 	}
 
@@ -961,9 +983,13 @@ main :: proc() {
 		fmt.println(" ---- ********************** ----", flush = true)
 	}
 
-	if .Sync in options.flags && !sync(preset_handle) {
-		log.info("Cannot syncronize")
-		return
+	if .Sync in options.flags {
+		tree_cache_name := strings.join({".", options.preset_name, "_", TREECACHE_NAME}, "")
+		defer delete(tree_cache_name)
+		if !sync(preset_handle, tree_cache_name) {
+			log.info("Cannot syncronize")
+			return
+		}
 	}
 
 }
