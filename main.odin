@@ -8,7 +8,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-PATH_SYNC_VERSION :: "0.3.1"
+PATH_SYNC_VERSION :: "0.3.2"
 
 OptionsSet :: distinct bit_set[OptionFlags]
 OptionFlags :: enum {
@@ -567,7 +567,7 @@ expand_folder :: proc(folder: ^FSObject, path: string) -> bool {
 		name := strings.cut(file.fullpath, pre_sep_path_rune_len)
 		if name[0] == '.' && strings.contains(name, TREECACHE_NAME) {
 			children2 := make([]FSObject, len(children) - 1)
-			copy(children2[:i], children[:i]) //slice ranges [x:y] <==> all i in x..<y
+			copy(children2[:], children[:i - shorting]) //slice ranges [x:y] <==> all i in x..<y
 			shorting += 1
 			delete(children)
 			children = children2
