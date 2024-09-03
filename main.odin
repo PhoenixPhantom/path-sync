@@ -8,7 +8,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-PATH_SYNC_VERSION :: "0.3.2"
+PATH_SYNC_VERSION :: "0.3.3"
 
 OptionsSet :: distinct bit_set[OptionFlags]
 OptionFlags :: enum {
@@ -574,11 +574,11 @@ expand_folder :: proc(folder: ^FSObject, path: string) -> bool {
 			continue
 		}
 		object := FSObject {
-			name   = name,
-			is_dir = file.is_dir,
+			name         = name,
+			is_dir       = file.is_dir,
+			last_changed = file.modification_time,
 		}
 		if file.is_dir do expand_folder(&object, file.fullpath) or_return
-		else do object.last_changed = file.modification_time
 		if object.last_changed._nsec > folder.last_changed._nsec do folder.last_changed = object.last_changed
 		children[i - shorting] = object
 	}
