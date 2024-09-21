@@ -8,7 +8,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-PATH_SYNC_VERSION :: "0.3.3"
+PATH_SYNC_VERSION :: "0.4.0"
 
 OptionsSet :: distinct bit_set[OptionFlags]
 OptionFlags :: enum {
@@ -16,6 +16,7 @@ OptionFlags :: enum {
 	Print,
 	Version,
 	Help,
+	Verbose,
 }
 
 Options :: struct {
@@ -58,6 +59,7 @@ print_usage :: proc() {
 	fmt.println("", flush = false)
 	fmt.println("  ---- Sync ----", flush = false)
 	fmt.println("     -sync(:preset-name)", flush = false)
+	fmt.println("     -verbose", flush = false)
 	fmt.println(
 		"        Combines and (if required) merges the contents of all sync paths given in the preset",
 		flush = false,
@@ -113,6 +115,8 @@ interpret_input :: proc() -> (opts: Options) {
 			opts.flags |= {.Version}
 		case arg == "-help", arg == "-h":
 			opts.flags |= {.Help}
+		case arg == "-verbose":
+			opts.flags |= {.Verbose}
 		case strings.index(arg, "-set:") == 0:
 			value_set := arg[5:]
 			results := strings.split(value_set, "=")
@@ -292,7 +296,7 @@ add_files :: proc(
 	child: DiffObject,
 	diff_trees: []DiffObject,
 	paths: []string,
-	$verbose: bool,
+	verbose: bool,
 ) -> (
 	additional_pass_required: bool,
 	ok: bool,
@@ -311,7 +315,7 @@ add_files :: proc(
 		changed: bool
 		unique_name_data, changed = find_unique_name(child.name, paths, i)
 		if changed {
-			when verbose {
+			if verbose {
 				log.warnf(
 					"Cannot add file %s/%s. This file already exists in some locations. Adding file with name %s instead",
 					paths[i],
@@ -332,7 +336,7 @@ add_files :: proc(
 			defer delete(path)
 			additional_pass_required = child.children != nil
 			if os.exists(path) {
-				when verbose do log.warnf("Folder already exists %s", path)
+				if verbose do log.warnf("Folder already exists %s", path)
 			} else {
 				mkdir_err := os.make_directory(path)
 				if mkdir_err != nil {
@@ -358,8 +362,10 @@ update_contents :: proc(
 	child: DiffObject,
 	diff_trees: []DiffObject,
 	paths: []string,
+	verbose: bool,
 ) -> bool {
 	if child.is_dir {
+		if verbose do log.infof("Updating directory %s", child.name)
 		sub_diffs: [dynamic]DiffObject
 		append(&sub_diffs, child)
 		sub_paths: [dynamic]string
@@ -372,7 +378,7 @@ update_contents :: proc(
 			if i == j do continue
 			if j < len(diff_trees) {
 				for other_child in diff_trees[j].children {
-					if other_child.name == child.name && other_child.is_dir {
+					if other_child.name == child.name && other_child.is_dir && child.is_dir {
 						//if we have already processed this update in a previous batch, we have already finished
 						if i > j do return true
 						append(&sub_diffs, other_child)
@@ -383,9 +389,10 @@ update_contents :: proc(
 			}
 			append(&passive_sub_paths, strings.join({paths[j], child.name}, SEPARATOR))
 		}
-		merge(sub_diffs[:], sub_paths[:], passive_sub_paths[:])
+		merge(sub_diffs[:], sub_paths[:], verbose, passive_sub_paths[:])
 
 	} else {
+		if verbose do log.infof("Updating file %s", child.name)
 		can_update := true
 		find_change: for other_tree, j in diff_trees {
 			if i == j do continue
@@ -405,18 +412,23 @@ update_contents :: proc(
 			return true
 		}
 
-		updated_data, ok := os.read_entire_file_from_filename(paths[i])
+		path_i := strings.join({paths[i], child.name}, SEPARATOR)
+		defer delete(path_i)
+		updated_data, ok := os.read_entire_file_from_filename(path_i)
 		if !ok {
-			log.warnf("Cannot read from changed file %s", paths[i])
+			log.warnf("Cannot read from changed file %s", path_i)
 			return false
 		}
 
 		for j in 0 ..< len(paths) {
 			if j == i do continue
-			if !os.exists(paths[j]) {
-				log.warnf("File %s Doesn't exist in %s. Creating new...", paths[i], paths[j])
+			path_j := strings.join({paths[j], child.name}, SEPARATOR)
+			if !os.exists(path_j) {
+				log.warnf("File %s Doesn't exist in %s. Creating new...", path_i, path_j)
 			}
-			os.write_entire_file(paths[j], updated_data)
+			if verbose do log.infof("Applying update from %s to %s", path_i, path_j)
+			os.write_entire_file(path_j, updated_data)
+			delete(path_j)
 		}
 	}
 	return true
@@ -493,7 +505,12 @@ remove_file :: proc(i: int, child: DiffObject, diff_trees: []DiffObject, paths: 
 	}
 }
 
-merge :: proc(diff_trees: []DiffObject, active_paths: []string, passive_paths: []string = nil) {
+merge :: proc(
+	diff_trees: []DiffObject,
+	active_paths: []string,
+	verbose: bool,
+	passive_paths: []string = nil,
+) {
 	assert(
 		len(diff_trees) == len(active_paths),
 		"Cannot have unequal number of trees and paths to them",
@@ -504,27 +521,11 @@ merge :: proc(diff_trees: []DiffObject, active_paths: []string, passive_paths: [
 
 	for diff_tree, i in diff_trees {
 		for child in diff_tree.children {
-			when ODIN_DEBUG && false {
-				if child.is_dir {
-					for j in i ..< len(diff_trees) {
-						for test_child in diff_trees[j].children {
-							assert(
-								test_child.name != child.name ||
-								(child.status == .Remove && test_child.status == .Remove) ||
-								(test_child.is_dir &&
-										(child.status == .Contents &&
-												test_child.status == .Contents)),
-								"Detected merge confilct",
-							)
-						}
-					}
-				}
-			}
-
 			switch child.status {
 			case .Add:
 				{
-					require_add_pass, ok := add_files(i, child, diff_trees, paths, true)
+					if verbose do log.infof("Adding %v", child.name)
+					require_add_pass, ok := add_files(i, child, diff_trees, paths, verbose)
 					if !ok {
 						log.warn("Couldn't add file. Continuing...")
 					}
@@ -533,11 +534,13 @@ merge :: proc(diff_trees: []DiffObject, active_paths: []string, passive_paths: [
 				}
 			case .Contents:
 				{
-					if !update_contents(i, child, diff_trees, paths) {
+					if verbose do log.infof("Updating %v", child.name)
+					if !update_contents(i, child, diff_trees, paths, verbose) {
 						log.warn("Failed to update contents. Continuing...")
 					}
 				}
 			case .Remove:
+				if verbose do log.infof("Removing %v", child.name)
 				remove_file(i, child, diff_trees, paths)
 			}
 		}
@@ -737,26 +740,28 @@ expand_diff_tree :: proc(current: FSObject) -> (diff: []DiffObject) {
 	return diff
 }
 
-create_diff_tree :: proc(last_saved, current: FSObject) -> (diff: []DiffObject) {
+create_diff_tree :: proc(last_saved, current: FSObject, verbose: bool) -> (diff: []DiffObject) {
 	diff_objects: [dynamic]DiffObject
 	find_deleted: for last_child in last_saved.children {
 		for current_child in current.children {
 			if current_child.name == last_child.name && current_child.is_dir == last_child.is_dir {
 				is_dir := current_child.is_dir
 				if current_child.last_changed._nsec > last_child.last_changed._nsec {
+					if verbose do log.infof("Changes were detected: %v", current_child.name)
 					difference := DiffObject {
 						name   = current_child.name,
 						is_dir = is_dir,
 						status = .Contents,
 					}
 					if is_dir {
-						difference.children = create_diff_tree(last_child, current_child)
+						difference.children = create_diff_tree(last_child, current_child, verbose)
 					}
 					append(&diff_objects, difference)
 				}
 				continue find_deleted
 			}
 		}
+		if verbose do log.infof("Removal of %v was detected", last_child.name)
 		append(
 			&diff_objects,
 			DiffObject{name = last_child.name, is_dir = last_child.is_dir, status = .Remove},
@@ -769,6 +774,7 @@ create_diff_tree :: proc(last_saved, current: FSObject) -> (diff: []DiffObject) 
 				continue find_new
 			}
 		}
+		if verbose do log.infof("Addition was detected: %v", current_child.name)
 		difference := DiffObject {
 			name   = current_child.name,
 			is_dir = current_child.is_dir,
@@ -785,7 +791,7 @@ create_diff_tree :: proc(last_saved, current: FSObject) -> (diff: []DiffObject) 
 }
 
 
-sync :: proc(config_handle: os.Handle, tree_cache_file: string) -> bool {
+sync :: proc(config_handle: os.Handle, tree_cache_file: string, verbose: bool) -> bool {
 	file := os.read_entire_file_from_handle(config_handle) or_return
 	it := string(file)
 
@@ -829,9 +835,9 @@ sync :: proc(config_handle: os.Handle, tree_cache_file: string) -> bool {
 		}
 	}
 
-	log.info("Loading filetrees...")
+	if verbose do log.info("Loading filetrees...")
 	for i in 0 ..< len(paths) {
-		log.info("Loading single folder tree...")
+		if verbose do log.info("Loading single folder tree...")
 		if !expand_folder(&object_trees[i], paths[i]) {
 			log.fatalf("Cannot expand folder %s.", paths[i])
 			continue
@@ -839,12 +845,11 @@ sync :: proc(config_handle: os.Handle, tree_cache_file: string) -> bool {
 		ok: bool
 		tree_caches[i], ok = open_tree_cache(paths[i], tree_cache_file)
 		if !ok {
-			log.fatalf("Cannot interpret tree cache in %s.", paths[i])
-			continue
+			log.warnf("Cannot interpret tree cache in %s. Creating a new one", paths[i])
 		}
 		if object_trees[i].last_changed._nsec > tree_caches[i].tree.last_changed._nsec {
 			diff := &diffs[i]
-			diff.children = create_diff_tree(tree_caches[i].tree, object_trees[i])
+			diff.children = create_diff_tree(tree_caches[i].tree, object_trees[i], verbose)
 			if diff.children != nil {
 				diff.is_dir = true
 				diff.status = .Contents
@@ -868,11 +873,11 @@ sync :: proc(config_handle: os.Handle, tree_cache_file: string) -> bool {
 		}
 	}
 
-	log.info("Merging...")
+	if verbose do log.info("Merging...")
+	merge(diffs, paths[:], verbose)
+	if verbose do log.info("Merge finished.")
 
-	merge(diffs, paths[:])
-
-	log.info("Updating tree cache...")
+	if verbose do log.info("Updating tree cache...")
 	for &filetree in tree_caches {
 		if !is_empty_tree_cache(filetree) do os.close(filetree.file_handle)
 	}
@@ -891,7 +896,7 @@ sync :: proc(config_handle: os.Handle, tree_cache_file: string) -> bool {
 	}
 
 	//actually do the merging
-	log.info("Successfully syncronized")
+	if verbose do log.info("Successfully syncronized")
 	return true
 }
 
@@ -986,7 +991,7 @@ main :: proc() {
 	if .Sync in options.flags {
 		tree_cache_name := strings.join({".", options.preset_name, "_", TREECACHE_NAME}, "")
 		defer delete(tree_cache_name)
-		if !sync(preset_handle, tree_cache_name) {
+		if !sync(preset_handle, tree_cache_name, .Verbose in options.flags) {
 			log.info("Cannot syncronize")
 			return
 		}
