@@ -1,8 +1,0 @@
-#!/bin/bash
-
-mount ~/mtp # force show the "allow" message on android
-umount ~/mtp
-read -s -n 1 -r -p "Accept the filesystem access on your tablet. Then press any key to continue..."
-mount ~/mtp
-path-sync -sync:tablet
-umount ~/mtp
